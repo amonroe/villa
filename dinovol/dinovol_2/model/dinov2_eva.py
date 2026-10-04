@@ -35,6 +35,27 @@ class InitWeights_He(object):
                 module.bias = nn.init.constant_(module.bias, 0)
 
 
+def _sdpa_head_dim_aligned(q, k, v, attn_mask=None, dropout_p=0.0):
+    """F.scaled_dot_product_attention with the head dim zero-padded to a multiple of 8.
+
+    The memory-efficient and flash SDPA kernels need head_dim % 8 == 0 for fp16/bf16
+    inputs. Otherwise PyTorch falls back to the math kernel, which materialises the
+    full (heads, N, N) score matrix (e.g. head_dim 54 for embed_dim 864 with 16 heads).
+    Zero-padding q/k/v leaves q @ k^T unchanged, so with the scale taken from the
+    original head dim and the padded output columns dropped the result is exact.
+    """
+    head_dim = q.shape[-1]
+    pad = -head_dim % 8
+    q, k, v = (F.pad(t, (0, pad)) for t in (q, k, v))
+    x = F.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        scale=head_dim ** -0.5,
+    )
+    return x[..., :head_dim]
+
+
 class EvaAttention(nn.Module):
     fused_attn: torch.jit.Final[bool]
 
@@ -127,11 +148,15 @@ class EvaAttention(nn.Module):
             k = apply_rotary_embedding(k, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
 
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.attn_drop.p if self.training else 0.,
-            )
+            dropout_p = self.attn_drop.p if self.training else 0.
+            if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16) and q.shape[-1] % 8:
+                x = _sdpa_head_dim_aligned(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+            else:
+                x = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                )
         else:
             raise RuntimeError("Fused attention should be used.")
             q = q * self.scale
